@@ -12,7 +12,8 @@ import {
     Pedestrian,
     Map,
     Settings,
-    Clean
+    Clean,
+    EdgeCluster
 } from '@vicons/carbon';
 import {ContractOutline, ExpandOutline} from "@vicons/ionicons5";
 import {t} from "@/language";
@@ -29,7 +30,8 @@ export interface IPreviewOperation {
 
 interface IPreviewOperationState {
     menuList: { [key: string]: IPreviewOperation },
-    autoRotateSpeed: number
+    autoRotateSpeed: number,
+    explodeScalar:number
 }
 
 export const usePreviewOperationStore = defineStore('previewOperation', {
@@ -52,6 +54,7 @@ export const usePreviewOperationStore = defineStore('previewOperation', {
                     }
                 }
             },
+            explode: {name: t("preview.Explode"), active: false, disabled: false, show: true, icon: EdgeCluster},
             roaming: {
                 name: t("preview.Roaming"),
                 active: false,
@@ -77,7 +80,8 @@ export const usePreviewOperationStore = defineStore('previewOperation', {
                 icon: ContractOutline
             },
         },
-        autoRotateSpeed: 20
+        autoRotateSpeed: 20,
+        explodeScalar: 1.0,
     }),
     getters: {},
     actions: {},

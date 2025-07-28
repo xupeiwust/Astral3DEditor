@@ -564,11 +564,13 @@ export default {
 		'Area':"面积",
 		'Angle':"角度",
 		'Clear measuring result':"清空测量结果",
+		'Explode': "爆炸",
 		'Roaming':"漫游",
 		'Mini map':"小地图",
 		'Settings':"设置",
 		// 操作栏相关
 		"Rotational speed":"旋转速度",
+		'Explode scalar': "爆炸因子",
 		"Please select initial position":"请选择初始位置",
 	},
 	plugin:{
