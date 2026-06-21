@@ -1,0 +1,125 @@
+name: 缺陷反馈
+description: 报告可复现的缺陷或回归。
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请尽量提供可复现步骤、版本、环境和最小复现材料。信息不足的 Issue 会被自动关闭。
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 清晰说明你遇到的问题、影响范围和触发条件。
+      placeholder: 请描述问题现象、影响范围，以及它为什么是一个缺陷。
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 按顺序写出可以触发问题的操作。
+      placeholder: |
+        1. 打开...
+        2. 点击...
+        3. 观察到...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+      description: 描述正常情况下应该发生什么。
+      placeholder: 例如：模型应正常加载，材质不应丢失。
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 描述实际发生了什么，包括报错、空白、卡顿或错误表现。
+      placeholder: 例如：控制台出现 xxx 错误，视口空白。
+    validations:
+      required: true
+  - type: textarea
+    id: code
+    attributes:
+      label: 最小复现代码
+      description: 如果可以，请提供能暴露问题的最小代码片段。
+      render: js
+      placeholder: 粘贴最小复现代码。
+    validations:
+      required: false
+  - type: input
+    id: live-example
+    attributes:
+      label: 最小复现链接
+      description: 如果有在线复现，请提供链接。
+      placeholder: https://...
+    validations:
+      required: false
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 截图或录屏
+      description: 如果问题涉及渲染效果、界面状态或报错，请拖拽截图或录屏。
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 你使用的库版本或提交版本。
+      placeholder: 例如：r184、v1.2.3、commit hash
+    validations:
+      required: true
+  - type: dropdown
+    id: device
+    attributes:
+      label: 设备
+      multiple: true
+      options:
+        - Desktop
+        - Mobile
+        - Headset
+    validations:
+      required: true
+  - type: dropdown
+    id: browser
+    attributes:
+      label: 浏览器
+      multiple: true
+      options:
+        - Chrome
+        - Firefox
+        - Safari
+        - Edge
+        - Quest Browser
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      multiple: true
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - ChromeOS
+        - Android
+        - iOS
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已经搜索过现有 Issue，确认这不是重复问题。
+          required: true
+        - label: 我提供的信息足以让维护者复现或定位问题。
+          required: true
