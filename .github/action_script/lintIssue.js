@@ -11,7 +11,9 @@ const ISSUE_LABELS = {
 	bug: "bug",
 	feature: "enhancement",
 	invalid: "invalid",
+	abuse: "invalid",
 };
+const OPTIONAL_ABUSE_LABEL = "abuse";
 
 const DEFAULT_PLACEHOLDER_PATTERNS = [
 	"a clear and concise",
@@ -30,7 +32,7 @@ const DEFAULT_PLACEHOLDER_PATTERNS = [
 ];
 
 /**
- * @typedef {"bug" | "feature" | "invalid"} IssueKind
+ * @typedef {"bug" | "feature" | "invalid" | "abuse"} IssueKind
  */
 
 /**
@@ -38,7 +40,9 @@ const DEFAULT_PLACEHOLDER_PATTERNS = [
  * @property {IssueKind} kind Issue 类型。
  * @property {boolean} isQualified Issue 内容是否通过自动检查。
  * @property {boolean} isTrustedAuthor 提交者是否为可信维护者。
+ * @property {boolean} isAbuse Issue 是否命中高置信违规骚扰规则。
  * @property {boolean} shouldClose 是否应该由工作流自动关闭。
+ * @property {boolean} shouldLock 是否应该由工作流自动锁定。
  * @property {string[]} labels 需要补充的标签。
  * @property {string[]} reasons 未通过原因。
  */
@@ -279,6 +283,29 @@ function countUrls(body) {
 }
 
 /**
+ * 判断文本是否命中“举报/违规/刷量威胁”高置信组合。
+ * 这里不按单个敏感词拦截，必须同时出现增长数据话题与平台处罚语义，降低误伤正常反馈的概率。
+ * @param {object} issue Issue 对象。
+ * @returns {string[]} 命中的违规骚扰原因。
+ */
+function detectAbuseReasons(issue) {
+	const issueText = stripMarkdownNoise(`${issue.title ?? ""}\n${issue.body ?? ""}`);
+	const hasGrowthTopic = /(?:star|stargazer|follower|刷星|刷量|刷赞|虚假(?:的)?数字|虚假人气|第三方推广|推广活动|账号的 follower)/iu.test(issueText);
+	const hasPlatformThreat = /(?:已举报(?:平台|github)|举报平台|github\s*(?:将|会|应该).{0,30}(?:清理|处理|关闭|封禁)|(?:违规|举报).{0,40}(?:关闭项目|清理违规人气|封禁|处罚)|(?:关闭项目|清理违规人气).{0,40}(?:违规|举报))/iu.test(issueText);
+	const hasCompetitiveAuditShape = /(?:竞品分析|公开透明).{0,80}(?:star|follower|stargazer)/iu.test(issueText);
+
+	if (hasGrowthTopic && hasPlatformThreat) {
+		return ["Issue 命中高置信违规骚扰规则：同时包含增长数据话题与平台举报/处罚威胁。"];
+	}
+
+	if (hasCompetitiveAuditShape && /(?:违规|举报|关闭项目|清理违规人气)/iu.test(issueText)) {
+		return ["Issue 命中高置信违规骚扰规则：疑似借竞品分析名义提交举报威胁内容。"];
+	}
+
+	return [];
+}
+
+/**
  * 根据标题、标签和字段判断 Issue 类型。
  * @param {object} issue Issue 对象。
  * @param {Map<string, string>} sections 字段映射。
@@ -438,11 +465,15 @@ function validateCommonSpamShape(issue) {
  */
 function evaluateIssue(issue) {
 	const sections = parseSections(issue.body ?? "");
-	const kind = detectIssueKind(issue, sections);
 	const isTrustedAuthor = TRUSTED_AUTHOR_ASSOCIATIONS.has(String(issue.author_association ?? "").toUpperCase());
-	let reasons = validateCommonSpamShape(issue);
+	const abuseReasons = detectAbuseReasons(issue);
+	const isAbuse = abuseReasons.length > 0;
+	const kind = isAbuse ? "abuse" : detectIssueKind(issue, sections);
+	let reasons = isAbuse ? abuseReasons : validateCommonSpamShape(issue);
 
-	if (kind === "bug") {
+	if (isAbuse) {
+		// 高置信违规骚扰内容不再继续跑模板字段校验，避免输出冗长误导原因。
+	} else if (kind === "bug") {
 		reasons = reasons.concat(validateBugIssue(issue, sections));
 	} else if (kind === "feature") {
 		reasons = reasons.concat(validateFeatureIssue(issue, sections));
@@ -452,13 +483,18 @@ function evaluateIssue(issue) {
 
 	const uniqueReasons = [...new Set(reasons)];
 	const isQualified = kind !== "invalid" && uniqueReasons.length === 0;
-	const labels = [ISSUE_LABELS[kind] ?? ISSUE_LABELS.invalid];
+	const labels = kind === "abuse"
+		? [ISSUE_LABELS.abuse, OPTIONAL_ABUSE_LABEL]
+		: [ISSUE_LABELS[kind] ?? ISSUE_LABELS.invalid];
+	const shouldClose = (!isQualified || isAbuse) && !isTrustedAuthor;
 
 	return {
 		kind,
 		isQualified,
 		isTrustedAuthor,
-		shouldClose: !isQualified && !isTrustedAuthor,
+		isAbuse,
+		shouldClose,
+		shouldLock: shouldClose && isAbuse,
 		labels,
 		reasons: uniqueReasons,
 	};
@@ -540,6 +576,15 @@ function parseJsonResponse(responseBody) {
 }
 
 /**
+ * 判断是否启用高置信违规 Issue 的删除动作。
+ * 默认关闭删除，必须显式设置 ISSUE_GATEKEEPER_DELETE_ABUSE=1 才会执行。
+ * @returns {boolean} 是否启用删除。
+ */
+function isAbuseDeletionEnabled() {
+	return process.env.ISSUE_GATEKEEPER_DELETE_ABUSE === "1";
+}
+
+/**
  * 添加 Issue 标签。标签不存在时只记录警告，避免影响关闭链路。
  * @param {string} owner 仓库所有者。
  * @param {string} repo 仓库名。
@@ -549,19 +594,23 @@ function parseJsonResponse(responseBody) {
  * @returns {Promise<void>}
  */
 async function addLabels(owner, repo, issueNumber, labels, token) {
-	if (!labels.length) {
+	const uniqueLabels = [...new Set(labels.filter(Boolean))];
+
+	if (!uniqueLabels.length) {
 		return;
 	}
 
-	try {
-		await requestGitHub(
-			"POST",
-			`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issueNumber}/labels`,
-			token,
-			{ labels },
-		);
-	} catch (error) {
-		console.warn(`[issue-gatekeeper] 标签添加失败，不影响后续处理：${error.message}`);
+	for (const label of uniqueLabels) {
+		try {
+			await requestGitHub(
+				"POST",
+				`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issueNumber}/labels`,
+				token,
+				{ labels: [label] },
+			);
+		} catch (error) {
+			console.warn(`[issue-gatekeeper] 标签 ${label} 添加失败，不影响后续处理：${error.message}`);
+		}
 	}
 }
 
@@ -644,6 +693,47 @@ async function closeIssue(owner, repo, issueNumber, token) {
 }
 
 /**
+ * 锁定高置信违规骚扰 Issue，阻断后续刷屏或争论。
+ * @param {string} owner 仓库所有者。
+ * @param {string} repo 仓库名。
+ * @param {number} issueNumber Issue 编号。
+ * @param {string} token GitHub Token。
+ * @returns {Promise<void>}
+ */
+async function lockIssue(owner, repo, issueNumber, token) {
+	await requestGitHub(
+		"PUT",
+		`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issueNumber}/lock`,
+		token,
+		{ lock_reason: "spam" },
+	);
+}
+
+/**
+ * 通过 GraphQL 删除 Issue。该动作默认不启用，且通常需要更高权限。
+ * @param {string} issueNodeId Issue 的 GraphQL Node ID。
+ * @param {string} token GitHub Token。
+ * @returns {Promise<void>}
+ */
+async function deleteIssue(issueNodeId, token) {
+	const response = await requestGitHub(
+		"POST",
+		"/graphql",
+		token,
+		{
+			query: "mutation DeleteIssue($issueId: ID!) { deleteIssue(input: { issueId: $issueId }) { clientMutationId } }",
+			variables: {
+				issueId: issueNodeId,
+			},
+		},
+	);
+
+	if (response && Array.isArray(response.errors) && response.errors.length > 0) {
+		throw new Error(`[issue-gatekeeper] GraphQL deleteIssue 失败：${JSON.stringify(response.errors).slice(0, 500)}`);
+	}
+}
+
+/**
  * 构建不合格 Issue 的回复内容。
  * @param {object} issue Issue 对象。
  * @param {IssueCheckResult} result 校验结果。
@@ -659,6 +749,15 @@ function buildUnqualifiedComment(issue, result) {
 ${reasonList}
 
 请使用仓库提供的 Issue 表单重新提交，或补齐信息后手动重新打开。维护者会优先处理包含可复现步骤、版本、环境和最小复现材料的 Issue。`;
+}
+
+/**
+ * 构建高置信违规骚扰 Issue 的短回复内容。
+ * @returns {string} 评论正文。
+ */
+function buildAbuseComment() {
+	return `${COMMENT_MARKER}
+该 Issue 命中仓库自动风控规则，已被关闭并锁定。`;
 }
 
 /**
@@ -702,7 +801,7 @@ async function main() {
 
 	const result = evaluateIssue(issue);
 	const dryRun = process.env.ISSUE_GATEKEEPER_DRY_RUN === "1";
-	console.log(`[issue-gatekeeper] #${issue.number} kind=${result.kind} qualified=${result.isQualified} trusted=${result.isTrustedAuthor}`);
+	console.log(`[issue-gatekeeper] #${issue.number} kind=${result.kind} qualified=${result.isQualified} trusted=${result.isTrustedAuthor} abuse=${result.isAbuse}`);
 
 	if (dryRun) {
 		console.log(JSON.stringify(result, null, 2));
@@ -719,10 +818,31 @@ async function main() {
 	await addLabels(owner, repo, issue.number, result.labels, token);
 
 	if (result.shouldClose) {
-		await upsertGatekeeperComment(owner, repo, issue.number, token, buildUnqualifiedComment(issue, result));
+		const commentBody = result.isAbuse ? buildAbuseComment() : buildUnqualifiedComment(issue, result);
+		await upsertGatekeeperComment(owner, repo, issue.number, token, commentBody);
 
 		if (issue.state !== "closed") {
 			await closeIssue(owner, repo, issue.number, token);
+		}
+
+		if (result.shouldLock) {
+			try {
+				await lockIssue(owner, repo, issue.number, token);
+			} catch (error) {
+				console.warn(`[issue-gatekeeper] 锁定违规 Issue 失败，不影响关闭结果：${error.message}`);
+			}
+		}
+
+		if (result.isAbuse && isAbuseDeletionEnabled()) {
+			if (!issue.node_id) {
+				console.warn("[issue-gatekeeper] 事件 payload 缺少 issue.node_id，无法执行 GraphQL deleteIssue。");
+			} else {
+				try {
+					await deleteIssue(issue.node_id, token);
+				} catch (error) {
+					console.warn(`[issue-gatekeeper] 删除违规 Issue 失败，已保留关闭和锁定结果：${error.message}`);
+				}
+			}
 		}
 
 		return;
@@ -752,6 +872,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+	detectAbuseReasons,
 	evaluateIssue,
 	parseSections,
 };

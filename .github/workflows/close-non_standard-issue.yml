@@ -28,4 +28,5 @@ jobs:
       - name: Validate issue content
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_GATEKEEPER_DELETE_ABUSE: ${{ vars.ISSUE_GATEKEEPER_DELETE_ABUSE }}
         run: node .github/action_script/lintIssue.js
