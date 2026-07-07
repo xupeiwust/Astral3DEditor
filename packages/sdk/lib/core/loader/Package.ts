@@ -5,7 +5,8 @@
  * @update 2025-02-14
  * @version 5.0.0
  */
-import { Mesh, Group, Bone } from "three";
+import { Mesh, Group, Bone, BufferAttribute } from "three";
+import type { InterleavedBufferAttribute, Texture } from "three";
 import { BASE64_TYPES, TYPED_ARRAYS } from "@/constant";
 import { fetchController, waitAstralZipConstructor, readAstralZipArrayBuffer, getAstralZipWorkers, readAstralZipText, readAstralZipBlob } from "@/utils";
 import { PackageSkeleton } from "@/core/loader/Package.Skeleton";
@@ -76,6 +77,38 @@ const toStandaloneArrayBuffer = (data: Uint8Array): ArrayBuffer => {
 	return Uint8Array.from(data).buffer as ArrayBuffer;
 };
 
+/**
+ * Package 分包需要跟随材质一起补齐的贴图槽
+ */
+const PACKAGE_MATERIAL_TEXTURE_PROPERTIES: ITHREEScene.MaterialTextureProperty[] = [
+	"map",
+	"matcap",
+	"alphaMap",
+	"lightMap",
+	"aoMap",
+	"bumpMap",
+	"normalMap",
+	"displacementMap",
+	"roughnessMap",
+	"metalnessMap",
+	"emissiveMap",
+	"specularMap",
+	"specularIntensityMap",
+	"specularColorMap",
+	"envMap",
+	"gradientMap",
+	"clearcoatMap",
+	"clearcoatRoughnessMap",
+	"clearcoatNormalMap",
+	"iridescenceMap",
+	"iridescenceThicknessMap",
+	"transmissionMap",
+	"thicknessMap",
+	"anisotropyMap",
+	"sheenColorMap",
+	"sheenRoughnessMap",
+];
+
 interface GroupJson {
 	images: any[];
 	geometries: any[];
@@ -135,6 +168,7 @@ export class Package {
 		this.callFunNum = { value: 0 };
 
 		this.skeletonClass = new PackageSkeleton();
+		this.loader.createMissingSkeletonBones = true;
 	}
 
 	/*  -------------------------------------------- 切片打包 ---------------------------------------------------   */
@@ -142,20 +176,31 @@ export class Package {
 	 * 处理 image json
 	 * @param imageJson
 	 * @param zipData 存储待压缩数据
+	 * @param ktx2SourceData GLTF/KTX2 导入阶段保留的原始 KTX2 二进制
 	 * @returns {string} 返回贴图存储文件名称
 	 */
-	handleImage(imageJson: ITHREEScene.ImageJSON, zipData: SourceData[]): string {
+	handleImage(imageJson: ITHREEScene.ImageJSON, zipData: SourceData[], ktx2SourceData?: ITHREEScene.KTX2SourceData): string {
+		if (ktx2SourceData?.buffer instanceof ArrayBuffer) {
+			const name = imageJson.uuid + ".ktx2";
+			zipData.push({ name, texture: ktx2SourceData.buffer });
+			return name;
+		}
+
 		if (typeof imageJson.url === "string") {
 			const name = imageJson.uuid + `.${BASE64_TYPES[imageJson.url.split(",")[0]]}`;
 			zipData.push({ name, texture: imageJson.url });
 			return name;
 		}
 
+		if ("isPackageKTX2Texture" in imageJson.url) {
+			const name = imageJson.uuid + ".ktx2";
+			zipData.push({ name, texture: imageJson.url.data });
+			return name;
+		}
+
 		// 20250707:three的toJSON方法暂不支持KTX2纹理，会返回{url:{},uuid:"xxxxx"}
 		if (!imageJson.url.type) {
-			const name = imageJson.uuid + `.ktx2`;
-			zipData.push({ name, texture: JSON.stringify(imageJson.url) });
-			return name;
+			throw new Error(`Package.handleImage: 缺少 KTX2 原始二进制，image uuid=${imageJson.uuid}`);
 		}
 
 		const name = `${imageJson.url.type}!${imageJson.url.width}!${imageJson.url.height}!${imageJson.uuid}.env`;
@@ -165,13 +210,102 @@ export class Package {
 	}
 
 	/**
+	 * 将 interleaved 属性转为独立 BufferAttribute，避免 three.js 序列化带 byteOffset 的共享底层 buffer
+	 * @param attribute GLTF/meshopt 解码后可能带偏移视图的 interleaved 属性
+	 * @returns {BufferAttribute} 返回只包含当前属性有效顶点范围的独立属性
+	 */
+	private createStandaloneBufferAttribute(attribute: InterleavedBufferAttribute): BufferAttribute {
+		const sourceArray = attribute.array;
+		const AttributeArray = sourceArray.constructor as ITHREEScene.BufferAttributeArrayConstructor;
+		const array = new AttributeArray(attribute.count * attribute.itemSize);
+		const stride = attribute.data.stride;
+		const offset = attribute.offset;
+
+		for (let vertexIndex = 0; vertexIndex < attribute.count; vertexIndex++) {
+			const sourceIndex = vertexIndex * stride + offset;
+			const targetIndex = vertexIndex * attribute.itemSize;
+
+			for (let componentIndex = 0; componentIndex < attribute.itemSize; componentIndex++) {
+				array[targetIndex + componentIndex] = sourceArray[sourceIndex + componentIndex];
+			}
+		}
+
+		const bufferAttribute = new BufferAttribute(array, attribute.itemSize, attribute.normalized);
+		if (attribute.name) bufferAttribute.name = attribute.name;
+		bufferAttribute.setUsage(attribute.data.usage);
+
+		return bufferAttribute;
+	}
+
+	/**
+	 * 序列化 Mesh，并在序列化窗口内规避 InterleavedBufferAttribute 共享 buffer 边界丢失
+	 * @param mesh 当前 Mesh 对象
+	 * @returns {ITHREEScene.MeshJSON} 返回用于 Package 分包的 Mesh JSON
+	 */
+	private serializeMeshJSON(mesh: Mesh): ITHREEScene.MeshJSON {
+		const geometry = mesh.geometry;
+		if (!geometry?.attributes) {
+			return mesh.toJSON() as unknown as ITHREEScene.MeshJSON;
+		}
+
+		const restoredAttributes: ITHREEScene.InterleavedAttributeRestore[] = [];
+
+		for (const attributeName in geometry.attributes) {
+			const attribute = geometry.attributes[attributeName];
+			if ((attribute as InterleavedBufferAttribute).isInterleavedBufferAttribute !== true) continue;
+
+			const interleavedAttribute = attribute as InterleavedBufferAttribute;
+			restoredAttributes.push({ name: attributeName, attribute: interleavedAttribute });
+			geometry.setAttribute(attributeName, this.createStandaloneBufferAttribute(interleavedAttribute));
+		}
+
+		try {
+			return mesh.toJSON() as unknown as ITHREEScene.MeshJSON;
+		} finally {
+			for (const restoredAttribute of restoredAttributes) {
+				geometry.setAttribute(restoredAttribute.name, restoredAttribute.attribute);
+			}
+		}
+	}
+
+	/**
+	 * 收集 GLTF/KTX2 加载阶段保留的原始 KTX2 二进制，避免把运行时 mipmap 展开成 JSON
+	 * @param mesh 当前正在打包的 Mesh
+	 * @returns {Map<string, ITHREEScene.KTX2SourceData>} 以 Source uuid 为键的 KTX2 原始数据
+	 */
+	private collectPackageKTX2Images(mesh: Mesh): Map<string, ITHREEScene.KTX2SourceData> {
+		const packageKTX2Images = new Map<string, ITHREEScene.KTX2SourceData>();
+		if (!mesh.material) return packageKTX2Images;
+
+		const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+
+		for (const material of materials) {
+			if (!material) continue;
+
+			const materialRecord = material as unknown as Record<ITHREEScene.MaterialTextureProperty, Texture | undefined>;
+			for (const textureProperty of PACKAGE_MATERIAL_TEXTURE_PROPERTIES) {
+				const texture = materialRecord[textureProperty];
+				const source = texture?.source as ITHREEScene.KTX2TextureSource | undefined;
+				const sourceUuid = source?.uuid;
+				const ktx2SourceData = source?.__astralPackageKTX2;
+				if (!sourceUuid || !(ktx2SourceData?.buffer instanceof ArrayBuffer)) continue;
+
+				packageKTX2Images.set(sourceUuid, ktx2SourceData);
+			}
+		}
+
+		return packageKTX2Images;
+	}
+
+	/**
 	 * 处理 mesh json
-	 * @param mesh
+	 * @param mesh 当前 Mesh 对象
 	 * @param json group json
 	 * @param zipData 存储待压缩数据
 	 */
 	handleMesh(mesh: Mesh, json: ITHREEScene.SceneJSON, zipData: SourceData[]) {
-		const meshJson: any = mesh.toJSON() as unknown as ITHREEScene.MeshJSON;
+		const meshJson: any = this.serializeMeshJSON(mesh);
+		const packageKTX2Images = this.collectPackageKTX2Images(mesh);
 
 		// 处理几何数据
 		if (meshJson.geometries) {
@@ -195,7 +329,7 @@ export class Package {
 
 					!json.images && (json.images = []);
 
-					const name = this.handleImage(image, zipData);
+					const name = this.handleImage(image, zipData, packageKTX2Images.get(image.uuid));
 					if (name) {
 						json.images.push(name);
 					}
@@ -579,6 +713,15 @@ export class Package {
 					data: data,
 				},
 			});
+		} else if (nameSplit[1] === "ktx2") {
+			this.imagesMap.set(nameSplit[0], {
+				uuid: nameSplit[0],
+				url: {
+					isPackageKTX2Texture: true,
+					data,
+					mimeType: "image/ktx2",
+				},
+			});
 		} else {
 			this.imagesMap.set(nameSplit[0], {
 				uuid: nameSplit[0],
@@ -820,7 +963,7 @@ export class Package {
 									 * 1.贴图为env格式（type!width!height!uuid.env），转换为arraybuffer格式，存入map
 									 * 2.贴图为普通图片格式，直接存入map
 									 **/
-									if (/\.env$/.test(fileName)) {
+									if (/\.(env|ktx2)$/.test(fileName)) {
 										// 转换回贴图原始信息，存入map
 										const content = await readAstralZipArrayBuffer(res, fileName);
 										this.unGzipImage(fileName.replace("Textures/", ""), content);
@@ -940,26 +1083,46 @@ export class Package {
 				}
 
 				// material->texture->image
-				if (child.material && group.materials?.findIndex(material => material.uuid === child.material) === -1) {
-					if (!this.materialsMap.has(child.material)) {
-						isDone = false;
-					} else {
-						group.materials.push(this.materialsMap.get(child.material));
+				if (child.material) {
+					const materialUuids = Array.isArray(child.material) ? child.material : [child.material];
 
-						const material = this.materialsMap.get(child.material);
-						if (material.map && group.textures?.findIndex(texture => texture.uuid === material.map) === -1) {
-							if (!this.textureMap.has(material.map)) {
+					for (const materialUuid of materialUuids) {
+						if (!materialUuid) continue;
+						if (!group.materials) group.materials = [];
+						if (!group.textures) group.textures = [];
+						if (!group.images) group.images = [];
+
+						let material = group.materials.find(item => item.uuid === materialUuid);
+						if (!material) {
+							if (!this.materialsMap.has(materialUuid)) {
 								isDone = false;
-							} else {
-								group.textures.push(this.textureMap.get(material.map));
+								continue;
+							}
 
-								const texture = this.textureMap.get(material.map);
-								if (texture.image && group.images?.findIndex(image => image.uuid === texture.image) === -1) {
-									if (!this.imagesMap.has(texture.image)) {
-										isDone = false;
-									} else {
-										group.images.push(this.imagesMap.get(texture.image));
-									}
+							material = this.materialsMap.get(materialUuid);
+							group.materials.push(material);
+						}
+
+						for (const textureProperty of PACKAGE_MATERIAL_TEXTURE_PROPERTIES) {
+							const textureUuid = material[textureProperty];
+							if (!textureUuid) continue;
+
+							let texture = group.textures.find(item => item.uuid === textureUuid);
+							if (!texture) {
+								if (!this.textureMap.has(textureUuid)) {
+									isDone = false;
+									continue;
+								}
+
+								texture = this.textureMap.get(textureUuid);
+								group.textures.push(texture);
+							}
+
+							if (texture.image && group.images.findIndex(image => image.uuid === texture.image) === -1) {
+								if (!this.imagesMap.has(texture.image)) {
+									isDone = false;
+								} else {
+									group.images.push(this.imagesMap.get(texture.image));
 								}
 							}
 						}
@@ -1074,7 +1237,7 @@ export class Package {
 									 * 1.贴图为env格式（type!width!height!uuid.env），转换为arraybuffer格式，存入map
 									 * 2.贴图为普通图片格式，直接存入map
 									 **/
-									if (/\.env$/.test(fileName)) {
+									if (/\.(env|ktx2)$/.test(fileName)) {
 										// 转换回贴图原始信息，存入map
 										const content = await readAstralZipArrayBuffer(res, fileName);
 										this.unGzipImage(fileName.replace("Textures/", ""), content);

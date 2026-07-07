@@ -921,6 +921,49 @@ class Loader {
 		const loader = new GLTFLoader(manager);
 		loader.setDRACOLoader(this.dracoLoader);
 		loader.setKTX2Loader(this.ktx2Loader);
+		// KTX2Loader 会把源文件转码成运行时 CompressedTexture，Package 需要额外保留原始 KTX2 二进制
+		loader.register((parser: any) => ({
+			name: "KHR_texture_basisu",
+			loadTexture(textureIndex: number) {
+				const json = parser.json;
+				const textureDef = json.textures?.[textureIndex];
+				const extension = textureDef?.extensions?.KHR_texture_basisu;
+				if (!extension) return null;
+
+				const ktx2Loader = parser.options.ktx2Loader;
+				if (!ktx2Loader) {
+					if (json.extensionsRequired?.includes("KHR_texture_basisu")) {
+						throw new Error("THREE.GLTFLoader: setKTX2Loader must be called before loading KTX2 textures");
+					}
+
+					return null;
+				}
+
+				const sourceIndex = extension.source;
+				const sourceDef = json.images?.[sourceIndex];
+				if (!sourceDef) return null;
+				if (sourceDef.bufferView === undefined && sourceDef.uri === undefined) {
+					throw new Error(`THREE.GLTFLoader: Image ${sourceIndex} is missing URI and bufferView`);
+				}
+
+				const ktx2BufferPromise: Promise<ArrayBuffer> = sourceDef.bufferView !== undefined
+					? parser.getDependency("bufferView", sourceDef.bufferView)
+					: parser.fileLoader.loadAsync(THREE.LoaderUtils.resolveURL(sourceDef.uri, parser.options.path));
+
+				return parser.loadTextureImage(textureIndex, sourceIndex, ktx2Loader).then(async (texture: THREE.Texture | null) => {
+					const ktx2Buffer = await ktx2BufferPromise;
+					if (!texture) return texture;
+
+					const source = texture.source as ITHREEScene.KTX2TextureSource;
+					source.__astralPackageKTX2 = {
+						buffer: ktx2Buffer,
+						mimeType: sourceDef.mimeType || "image/ktx2",
+					};
+
+					return texture;
+				});
+			},
+		}));
 		loader.setMeshoptDecoder(MeshoptDecoder);
 
 		return loader;

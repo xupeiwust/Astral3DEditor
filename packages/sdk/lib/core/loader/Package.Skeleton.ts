@@ -2,97 +2,150 @@
  * @author MaHaiBing
  * @email  mlt131220@163.com
  * @date   2024/8/3 22:49
- * @description 包 骨骼处理
+ * @description Package 解包骨骼处理
  */
-import {Skeleton, Bone, Object3D } from "three";
+import type { Bone, Object3D, SkinnedMesh } from "three";
 
-export class PackageSkeleton{
-    // 场景内所有骨骼的map
-    private boneMap = new Map<string,Bone>();
-    // 场景内所有骨架的map <skeletonUuid:string,skeleton:Skeleton>
-    private skeletonsMap  = new Map<string, Skeleton>();
-    // 骨架未对应上的骨骼 <boneUuid:string,skeleton:Skeleton[]>
-    private unMatchBoneMap  = new Map<string, Skeleton[]>();
+/**
+ * Package 分包解包期间维护 Bone 与 Skeleton 的延迟绑定
+ * 生命周期绑定到一次 Package 解包流程，解包结束后必须调用 clear 释放缓存引用
+ */
+export class PackageSkeleton {
+    // 场景内已经解包完成的真实 Bone
+    private boneMap = new Map<string, Bone>();
+    // 场景内已经建立的 Skeleton 绑定关系
+    private skeletonsMap  = new Map<string, ITHREEScene.SkeletonBinding>();
+    // ObjectLoader 先创建占位 Bone 时，记录后续需要按索引回填的位置
+    private unMatchBoneMap  = new Map<string, ITHREEScene.PendingSkeletonBone[]>();
 
     constructor() {
     }
 
-    addBones(bones:Bone[]){
+    /**
+     * 刷新 Skeleton 绑定后的 SkinnedMesh 状态
+     * @param binding 当前 Skeleton 和引用它的 SkinnedMesh 绑定关系
+     * @returns {void}
+     */
+    private refreshSkinnedMeshes(binding: ITHREEScene.SkeletonBinding): void {
+        binding.skeleton.update();
+
+        binding.skinnedMeshes.forEach(skinnedMesh => {
+            const skinnedMeshBounds = skinnedMesh as unknown as ITHREEScene.SkinnedMeshBounds;
+            skinnedMesh.skeleton = binding.skeleton;
+            // SkinnedMesh 的包围体会参与视锥裁剪，骨骼替换后必须让 three 重新计算
+            skinnedMeshBounds.boundingSphere = null;
+            skinnedMeshBounds.boundingBox = null;
+        });
+    }
+
+    /**
+     * 收集当前分包内引用指定 Skeleton 的 SkinnedMesh
+     * @param group 当前已解包的对象树
+     * @param skeletonUuid Skeleton uuid
+     * @param binding 已存在的 Skeleton 绑定记录
+     * @returns {ITHREEScene.SkeletonBinding | undefined} 更新后的 Skeleton 绑定记录
+     */
+    private collectSkeletonBinding(
+        group: Object3D,
+        skeletonUuid: string,
+        binding?: ITHREEScene.SkeletonBinding
+    ): ITHREEScene.SkeletonBinding | undefined {
+        const skinnedMeshes = binding?.skinnedMeshes || [];
+        let runtimeSkeleton = binding?.skeleton;
+
+        group.traverse(object => {
+            const skinnedMesh = object as SkinnedMesh;
+            const skeleton = skinnedMesh.skeleton;
+            if (!skeleton?.uuid || skeleton.uuid !== skeletonUuid) return;
+
+            runtimeSkeleton = runtimeSkeleton || skeleton;
+            if (!skinnedMeshes.includes(skinnedMesh)) {
+                skinnedMeshes.push(skinnedMesh);
+            }
+        });
+
+        if (!runtimeSkeleton || skinnedMeshes.length === 0) return;
+
+        return {
+            skeleton: runtimeSkeleton,
+            skinnedMeshes,
+        };
+    }
+
+    /**
+     * 登记当前分包已经加载完成的真实 Bone，并修复等待中的 Skeleton
+     * @param bones 当前分包对象树中的 Bone 列表
+     */
+    addBones(bones: Bone[]): void {
         bones.forEach(bone => {
-            if(this.boneMap.has(bone.uuid)) return;
+            if (this.boneMap.has(bone.uuid)) return;
 
             this.boneMap.set(bone.uuid,bone);
 
-            if(this.unMatchBoneMap.has(bone.uuid)){
-                const skeletons = this.unMatchBoneMap.get(bone.uuid) as Skeleton[];
+            if (this.unMatchBoneMap.has(bone.uuid)) {
+                const pendingBones = this.unMatchBoneMap.get(bone.uuid) as ITHREEScene.PendingSkeletonBone[];
 
-                skeletons.forEach(skeleton => {
-                    skeleton.bones.push(bone);
-
-                    // 骨骼找到一个替换一个loader.parse时对应骨骼（Bone）还未加载，生成的空骨骼
-                    const d = skeleton.bones.findIndex(bone => bone.userData.waitDelete);
-                    if(d === -1) return;
-                    skeleton.bones.splice(d,1);
-                })
+                pendingBones.forEach(pendingBone => {
+                    pendingBone.skeleton.bones[pendingBone.boneIndex] = bone;
+                    this.refreshSkinnedMeshes({
+                        skeleton: pendingBone.skeleton,
+                        skinnedMeshes: pendingBone.skinnedMeshes,
+                    });
+                });
 
                 this.unMatchBoneMap.delete(bone.uuid);
             }
-        })
+        });
     }
 
-    handleSkeletons(skeletons,group:Object3D){
+    /**
+     * 处理当前分包内的 Skeleton JSON，保证骨骼按原始索引回填
+     * @param skeletons 当前分包内的 Skeleton JSON 列表
+     * @param group 当前已解包的对象树
+     */
+    handleSkeletons(skeletons: import("three").SkeletonJSON[],group: Object3D): void {
         skeletons.forEach(skeleton => {
-            if(this.skeletonsMap.has(skeleton.uuid)) return;
+            const binding = this.collectSkeletonBinding(group, skeleton.uuid, this.skeletonsMap.get(skeleton.uuid));
+            if (!binding) return;
 
-            let skinnedMesh;
-            group.traverse((m)=> {
-                if(!m.skeleton?.uuid) return;
+            const bonesUuid: string[] = skeleton.bones.slice();
 
-                if(m.skeleton.uuid === skeleton.uuid){
-                    skinnedMesh = m;
-                }
-            })
-            if(!skinnedMesh) return;
-
-            // 此骨架的原骨骼（Bone）uuid数组
-            const bonesUuid:string[] = skeleton.bones;
-
-            // 对比skinnedMesh.skeleton.bones 和 skeleton.bones
-            for(let i  = skinnedMesh.skeleton.bones.length;i > 0;i--){
-                const bone = skinnedMesh.skeleton.bones[i  - 1];
-                const u = bonesUuid.indexOf(bone.uuid);
-
-                if(u === -1){
-                    // 和原数组没匹配上，说明此骨骼不是原骨骼，是loader.parse时对应骨骼（Bone）还未加载，生成的新的空骨骼
-                    // 但不能直接从skeleton中删除，需要之后找到对应骨骼一个一个替换
-                    bone.userData.waitDelete = true;
-                }else{
-                    bonesUuid.splice(u,1);
-                }
-            }
-
-            if(bonesUuid.length > 0){
-                // 在已存储的骨骼中寻找
-                for(let i = bonesUuid.length;i > 0;i--){
-                    if(this.boneMap.has(bonesUuid[i])){
-                        skinnedMesh.skeleton.bones.push(<Bone>this.boneMap.get(bonesUuid[i]));
-
-                        bonesUuid.splice(i,1);
-                    }
+            bonesUuid.forEach((boneUuid, boneIndex) => {
+                const matchedBone = this.boneMap.get(boneUuid);
+                if (matchedBone) {
+                    binding.skeleton.bones[boneIndex] = matchedBone;
+                    return;
                 }
 
-                bonesUuid.forEach(uuid => {
-                    const skeletons = this.unMatchBoneMap.get(uuid) || [];
-                    skeletons.push(skinnedMesh.skeleton);
-                    this.unMatchBoneMap.set(uuid,skeletons);
-                })
-            }
+                const currentBone = binding.skeleton.bones[boneIndex];
+                const currentBoneUserData = currentBone?.userData as ITHREEScene.SkeletonPlaceholderBoneUserData | undefined;
+                if (currentBone?.uuid === boneUuid && currentBoneUserData?.__astralPackageSkeletonPlaceholder !== true) {
+                    this.boneMap.set(boneUuid, currentBone);
+                    return;
+                }
 
-            this.skeletonsMap.set(skeleton.uuid,skinnedMesh.skeleton);
-        })
+                const pendingBones = this.unMatchBoneMap.get(boneUuid) || [];
+                if (!pendingBones.some(pendingBone => pendingBone.skeleton === binding.skeleton && pendingBone.boneIndex === boneIndex)) {
+                    pendingBones.push({
+                        skeleton: binding.skeleton,
+                        boneIndex,
+                        skinnedMeshes: binding.skinnedMeshes,
+                    });
+                }
+
+                this.unMatchBoneMap.set(boneUuid,pendingBones);
+            });
+
+            this.refreshSkinnedMeshes(binding);
+            this.skeletonsMap.set(skeleton.uuid,binding);
+        });
     }
 
-    clear(){
+    /**
+     * 清理解包过程缓存，避免跨场景复用骨骼状态
+     * @returns {void}
+     */
+    clear(): void {
         this.boneMap.clear();
         this.skeletonsMap.clear();
         this.unMatchBoneMap.clear();

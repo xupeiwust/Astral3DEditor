@@ -5,7 +5,9 @@
  * @description 来自于THREE.ObjectLoader，修改了部分代码，添加了部分功能
  */
 import * as THREE from 'three';
+import {KTX2Loader} from 'three/examples/jsm/loaders/KTX2Loader.js';
 import {TYPED_ARRAYS,TEXTURE_MAPPING,TEXTURE_WRAPPING,TEXTURE_FILTER} from '@/constant/index';
+import {useDispatchSignal} from "@/hooks";
 import ParticleEmitter from "@/core/objects/ParticleEmitter";
 import Billboard from "@/core/objects/Billboard";
 import {HtmlPanel, HtmlSprite} from "@/core/objects/HtmlPanel";
@@ -13,6 +15,7 @@ import {HtmlPanel, HtmlSprite} from "@/core/objects/HtmlPanel";
 class ObjectLoader extends THREE.Loader {
     constructor(manager) {
         super(manager);
+        this.createMissingSkeletonBones = false;
     }
 
     load(url, onLoad, onProgress, onError) {
@@ -89,6 +92,18 @@ class ObjectLoader extends THREE.Loader {
     }
 
     parse(json, onLoad) {
+
+        const hasPackageKTX2Images = Array.isArray(json.images) && json.images.some(image => image?.url?.isPackageKTX2Texture === true);
+        if (hasPackageKTX2Images) {
+            this.parseAsync(json).then(object => {
+                if (onLoad !== undefined) onLoad(object);
+            }).catch(error => {
+                console.error('THREE.ObjectLoader: Can\'t parse package KTX2 texture.', error);
+                throw error;
+            });
+
+            return null;
+        }
 
         const animations = this.parseAnimations(json.animations);
         const shapes = this.parseShapes(json.shapes);
@@ -193,6 +208,17 @@ class ObjectLoader extends THREE.Loader {
         if (json !== undefined) {
 
             for (let i = 0, l = json.length; i < l; i++) {
+                if (this.createMissingSkeletonBones === true && Array.isArray(json[i]?.bones)) {
+                    json[i].bones.forEach(uuid => {
+                        if (bones[uuid] !== undefined) return;
+
+                        const bone = new THREE.Bone();
+                        bone.uuid = uuid;
+                        // Package 分包解包时 Bone 可能在后续分包才出现，先保留索引和 uuid 让 PackageSkeleton 原位替换
+                        bone.userData.__astralPackageSkeletonPlaceholder = true;
+                        bones[uuid] = bone;
+                    });
+                }
 
                 const skeleton = new THREE.Skeleton().fromJSON(json[i], bones);
 
@@ -429,6 +455,40 @@ class ObjectLoader extends THREE.Loader {
         const images = {};
 
         let loader;
+        let ktx2Loader;
+
+        /**
+         * 创建并初始化 Package KTX2 解包专用 Loader
+         * @returns {KTX2Loader} 返回已完成渲染器能力检测的 KTX2Loader
+         */
+        function getKTX2Loader() {
+            if (!ktx2Loader) {
+                ktx2Loader = new KTX2Loader();
+                ktx2Loader.setTranscoderPath(new URL(import.meta.env.BASE_URL + 'libs/basis', import.meta.url).href + "/");
+                useDispatchSignal("rendererDetectKTX2Support", ktx2Loader);
+            }
+
+            return ktx2Loader;
+        }
+
+        /**
+         * 将 Package 内的原始 KTX2 二进制恢复为 CompressedTexture
+         * @param image Package 解包阶段构造的 KTX2 图片描述
+         * @returns {Promise<THREE.CompressedTexture>} 返回恢复后的压缩纹理
+         */
+        async function parsePackageKTX2Texture(image) {
+            return await new Promise((resolve, reject) => {
+                // KTX2Loader 会把入参 buffer 转交 worker，必须传副本，原始 buffer 保留给后续再次保存
+                getKTX2Loader().parse(image.data.slice(0), texture => {
+                    texture.source.__astralPackageKTX2 = {
+                        buffer: image.data,
+                        mimeType: image.mimeType || "image/ktx2"
+                    };
+
+                    resolve(texture);
+                }, reject);
+            });
+        }
 
         async function deserializeImage(image) {
 
@@ -441,6 +501,10 @@ class ObjectLoader extends THREE.Loader {
                 return await loader.loadAsync(path);
 
             } else {
+
+                if (image.isPackageKTX2Texture === true) {
+                    return await parsePackageKTX2Texture(image);
+                }
 
                 if (image.data) {
 
@@ -465,52 +529,70 @@ class ObjectLoader extends THREE.Loader {
             loader = new THREE.ImageLoader(this.manager);
             loader.setCrossOrigin(this.crossOrigin);
 
-            for (let i = 0, il = json.length; i < il; i++) {
+            try {
+                for (let i = 0, il = json.length; i < il; i++) {
 
-                const image = json[i];
-                const url = image.url;
+                    const image = json[i];
+                    const url = image.url;
 
-                if (Array.isArray(url)) {
+                    if (Array.isArray(url)) {
 
-                    // load array of images e.g CubeTexture
+                        // load array of images e.g CubeTexture
 
-                    const imageArray = [];
+                        const imageArray = [];
 
-                    for (let j = 0, jl = url.length; j < jl; j++) {
+                        for (let j = 0, jl = url.length; j < jl; j++) {
 
-                        const currentUrl = url[j];
+                            const currentUrl = url[j];
 
-                        const deserializedImage = await deserializeImage(currentUrl);
+                            const deserializedImage = await deserializeImage(currentUrl);
 
-                        if (deserializedImage !== null) {
+                            if (deserializedImage !== null) {
 
-                            if (deserializedImage instanceof HTMLImageElement) {
+                                if (deserializedImage instanceof HTMLImageElement) {
 
-                                imageArray.push(deserializedImage);
+                                    imageArray.push(deserializedImage);
 
-                            } else {
+                                } else {
 
-                                // special case: handle array of data textures for cube textures
+                                    // special case: handle array of data textures for cube textures
 
-                                imageArray.push(new THREE.DataTexture(deserializedImage.data, deserializedImage.width, deserializedImage.height));
+                                    imageArray.push(new THREE.DataTexture(deserializedImage.data, deserializedImage.width, deserializedImage.height));
+
+                                }
 
                             }
 
                         }
 
+                        images[image.uuid] = new THREE.Source(imageArray);
+
+                    } else {
+
+                        // load single image
+
+                        const deserializedImage = await deserializeImage(image.url);
+                        const source = deserializedImage?.isCompressedTexture === true
+                            ? new THREE.Source(deserializedImage.image)
+                            : new THREE.Source(deserializedImage);
+                        if (deserializedImage?.isCompressedTexture === true) {
+                            // 压缩贴图的 Source.data 必须保持为 image 描述，不能塞入 Texture 实例
+                            source.__astralPackageKTX2Texture = deserializedImage;
+
+                            if (deserializedImage.source?.__astralPackageKTX2) {
+                                source.__astralPackageKTX2 = deserializedImage.source.__astralPackageKTX2;
+                            }
+                        }
+                        images[image.uuid] = source;
+
                     }
 
-                    images[image.uuid] = new THREE.Source(imageArray);
-
-                } else {
-
-                    // load single image
-
-                    const deserializedImage = await deserializeImage(image.url);
-                    images[image.uuid] = new THREE.Source(deserializedImage);
-
                 }
-
+            } finally {
+                if (ktx2Loader) {
+                    ktx2Loader.dispose();
+                    ktx2Loader = null;
+                }
             }
 
         }
@@ -553,6 +635,7 @@ class ObjectLoader extends THREE.Loader {
 
                 const source = images[data.image];
                 const image = source.data;
+                const compressedSourceTexture = source.__astralPackageKTX2Texture || (image?.isCompressedTexture === true ? image : null);
 
                 let texture;
 
@@ -561,6 +644,13 @@ class ObjectLoader extends THREE.Loader {
                     texture = new THREE.CubeTexture();
 
                     if (image.length === 6) texture.needsUpdate = true;
+
+                } else if (compressedSourceTexture?.isCompressedTexture === true) {
+
+                    texture = compressedSourceTexture.clone();
+                    if (image?.isCompressedTexture === true) {
+                        source.data = compressedSourceTexture.image;
+                    }
 
                 } else {
 
@@ -579,6 +669,7 @@ class ObjectLoader extends THREE.Loader {
                 }
 
                 texture.source = source;
+                if (compressedSourceTexture?.isCompressedTexture === true) texture.needsUpdate = true;
 
                 texture.uuid = data.uuid;
 
@@ -621,6 +712,10 @@ class ObjectLoader extends THREE.Loader {
 
             }
 
+        }
+
+        for (const uuid in images) {
+            delete images[uuid].__astralPackageKTX2Texture;
         }
 
         return textures;
